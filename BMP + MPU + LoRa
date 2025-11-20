@@ -1,0 +1,177 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <Adafruit_BMP180.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// -------------------- USER CONFIG --------------------
+#define DEBUG_SERIAL       1   // 1 = print debug info over USB serial, 0 = silent
+
+// LoRa settings (adjust to competition band)
+#define LORA_FREQ          433E6   // change to 868E6 or 915E6 if required
+#define NSS_PIN            10
+#define RST_PIN            9
+#define DIO0_PIN           2
+
+const unsigned long LORA_INTERVAL_MS = 1000UL; // 1s between packets
+
+const int LORA_TX_POWER_DBM = 20;   // TX power
+const int LORA_SF = 11;             // spreading factor
+const long LORA_BW = 125E3;         // bandwidth
+const int LORA_CR = 8;              // coding rate denominator (4/8)
+
+// -------------------- SENSORS --------------------
+Adafruit_BMP280 bmp;     
+Adafruit_MPU6050 mpu;
+
+// variables
+float ax, ay, az, gx, gy, gz;
+float tempMPU, tempBMP, pressureBMP, altitude, altitudeFiltered = 0;
+float alpha = 0.9;   // filter factor
+
+// -------------------- HELPERS --------------------
+void loraConfigureRadio() {
+  LoRa.setTxPower(LORA_TX_POWER_DBM);
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setCodingRate4(LORA_CR);
+  LoRa.enableCrc();
+}
+
+static inline void appendInt16Scaled(uint8_t *buf, size_t &idx, float value, float scale) {
+  int32_t scaled = (int32_t) roundf(value * scale);
+  if (scaled > 32767) scaled = 32767;
+  if (scaled < -32768) scaled = -32768;
+  int16_t v16 = (int16_t) scaled;
+  buf[idx++] = (uint8_t)(v16 & 0xFF);
+  buf[idx++] = (uint8_t)((v16 >> 8) & 0xFF);
+}
+
+static inline void appendUInt32(uint8_t *buf, size_t &idx, uint32_t v) {
+  buf[idx++] = (uint8_t)(v & 0xFF);
+  buf[idx++] = (uint8_t)((v >> 8) & 0xFF);
+  buf[idx++] = (uint8_t)((v >> 16) & 0xFF);
+  buf[idx++] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+void sendLoRaPacketBinary(unsigned long now_ms_local) {
+  uint8_t buf[32];
+  size_t idx = 0;
+
+  appendUInt32(buf, idx, (uint32_t)now_ms_local);
+
+  appendInt16Scaled(buf, idx, ax, 100.0f);     // m/s² *100
+  appendInt16Scaled(buf, idx, ay, 100.0f);
+  appendInt16Scaled(buf, idx, az, 100.0f);
+
+  appendInt16Scaled(buf, idx, gx, 1000.0f);    // rad/s *1000
+  appendInt16Scaled(buf, idx, gy, 1000.0f);
+  appendInt16Scaled(buf, idx, gz, 1000.0f);
+
+  appendInt16Scaled(buf, idx, tempMPU, 100.0f); // °C *100
+  appendInt16Scaled(buf, idx, tempBMP, 100.0f);
+
+  appendUInt32(buf, idx, (uint32_t)pressureBMP); // Pa
+
+  appendInt16Scaled(buf, idx, altitude, 10.0f);         // m *10
+  appendInt16Scaled(buf, idx, altitudeFiltered, 10.0f);
+
+  LoRa.beginPacket();
+  LoRa.write(buf, idx);
+  LoRa.endPacket();
+
+  if (DEBUG_SERIAL) {
+    Serial.print(F("[LORA TX] ")); 
+    Serial.print(idx); 
+    Serial.println(F(" bytes sent"));
+  }
+}
+
+// -------------------- SETUP --------------------
+void setup() {
+  if (DEBUG_SERIAL) {
+    Serial.begin(9600);
+    while (!Serial) delay(10);
+    Serial.println(F("Starting CanSat..."));
+  }
+
+  // I2C init
+  Wire.begin();
+
+  // BMP init
+  if (!bmp.begin(0x76)) {
+    if (DEBUG_SERIAL) Serial.println(F("BMP280 not found!"));
+    while (1);
+  }
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                  Adafruit_BMP280::SAMPLING_X2,
+                  Adafruit_BMP280::SAMPLING_X16,
+                  Adafruit_BMP280::FILTER_X16,
+                  Adafruit_BMP280::STANDBY_MS_500);
+
+  // MPU init
+  if (!mpu.begin()) {
+    if (DEBUG_SERIAL) Serial.println(F("MPU6050 not found!"));
+    while (1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // LoRa init
+  LoRa.setPins(NSS_PIN, RST_PIN, DIO0_PIN);
+  if (!LoRa.begin(LORA_FREQ)) {
+    if (DEBUG_SERIAL) Serial.println(F("LoRa init failed!"));
+    while (1);
+  }
+  loraConfigureRadio();
+  if (DEBUG_SERIAL) Serial.println(F("LoRa ready"));
+}
+
+// -------------------- LOOP --------------------
+void loop() {
+  static unsigned long lastLoRa = 0;
+  unsigned long now = millis();
+
+  // Read MPU
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+  ax = a.acceleration.x;
+  ay = a.acceleration.y;
+  az = a.acceleration.z;
+  gx = g.gyro.x;
+  gy = g.gyro.y;
+  gz = g.gyro.z;
+  tempMPU = t.temperature;
+
+  // Read BMP
+  tempBMP = bmp.readTemperature();
+  pressureBMP = bmp.readPressure();
+  altitude = bmp.readAltitude(1013.25);
+  altitudeFiltered = alpha * altitudeFiltered + (1 - alpha) * altitude;
+
+  // LoRa send every interval
+  if (now - lastLoRa >= LORA_INTERVAL_MS) {
+    lastLoRa = now;
+    sendLoRaPacketBinary(now);
+  }
+
+  // Debug serial print
+  if (DEBUG_SERIAL) {
+    Serial.print(now); Serial.print(",");
+    Serial.print(ax); Serial.print(",");
+    Serial.print(ay); Serial.print(",");
+    Serial.print(az); Serial.print(",");
+    Serial.print(gx); Serial.print(",");
+    Serial.print(gy); Serial.print(",");
+    Serial.print(gz); Serial.print(",");
+    Serial.print(tempMPU); Serial.print(",");
+    Serial.print(tempBMP); Serial.print(",");
+    Serial.print(pressureBMP); Serial.print(",");
+    Serial.print(altitude); Serial.print(",");
+    Serial.println(altitudeFiltered);
+  }
+
+  delay(50);
+}
